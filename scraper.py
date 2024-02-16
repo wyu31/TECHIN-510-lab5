@@ -3,16 +3,50 @@ import json
 import datetime
 from zoneinfo import ZoneInfo
 import html
-import time
+
 import requests
 
 from db import get_db_conn
 
+# Base URLs for geolocation and weather APIs
+CORD_BASE_URL = "https://nominatim.openstreetmap.org/search.php"
+WEATHER_BASE_URL = "https://api.weather.gov/points/"
+
 URL = 'https://visitseattle.org/events/page/'
 URL_LIST_FILE = './data/links.json'
 URL_DETAIL_FILE = './data/data.json'
-WEATHER_CACHE = {}
-SLEEP_INTERVAL = 0.1
+
+def get_geolocation(venue, location):
+    params = {
+        'q': f'{venue}, {location}',
+        'format': 'json'
+    }
+    response = requests.get(CORD_BASE_URL, params=params)
+    data = response.json()
+    if data:
+        lat = data[0]['lat']
+        lon = data[0]['lon']
+        return lat, lon
+    else:
+        return None, None
+
+def get_weather(lat, lon):
+    # Assuming the response structure allows direct extraction of desired data
+    response = requests.get(f"{WEATHER_BASE_URL}{lat},{lon}")
+    data = response.json()
+    forecast_url = data['properties']['forecast']
+    weather_response = requests.get(forecast_url)
+    weather_data = weather_response.json()
+    
+    # Extracting detailed weather information
+    detailed_forecast = weather_data['properties']['periods'][0]  # Assuming first period is desired
+    weather_info = {
+        'condition': detailed_forecast.get('shortForecast', 'Not available'),
+        'temperature_min': detailed_forecast.get('temperature', 'Not available'),  # Assuming API provides this directly
+        'temperature_max': detailed_forecast.get('temperature', 'Not available'),  # May need adjustment based on API
+        'windchill': detailed_forecast.get('temperature', 'Not available')  # Placeholder, adjust based on actual API data
+    }
+    return weather_info
 
 def list_links():
     res = requests.get(URL + '1/')
@@ -25,119 +59,83 @@ def list_links():
 
     json.dump(links, open(URL_LIST_FILE, 'w'))
 
-def get_geolocation(venue, location):
-    cord_base_url = "https://nominatim.openstreetmap.org/search.php"
-    try:
-        # first try to find the location with the venue name
-        query_params = {
-            "q": venue + ", Seattle",
-            "format": "jsonv2"
-        }
-        # specify headers
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
-            'Referer': 'https://nominatim.openstreetmap.org/ui/search.html'
-        }
-        res_cord = requests.get(cord_base_url, params=query_params, headers=headers)
-        res_dict = res_cord.json()
-        return (res_dict[0]['lat'], res_dict[0]['lon'])
-    except:
-        try: 
-            # if not found, try to find location with location name
-            query_params = {
-                "q": location + ", Seattle",
-                "format": "jsonv2"
-            }
-            # specify headers
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3',
-                'Referer': 'https://nominatim.openstreetmap.org/ui/search.html'
-            }
-            res_cord = requests.get(cord_base_url, params=query_params, headers=headers)
-            res_dict = res_cord.json()
-            return (res_dict[0]['lat'], res_dict[0]['lon'])
-        except:
-            # if still not found, return None
-            return (None, None)
-
-def get_weather(geolocation, date):
-    if geolocation is None:
-        return None, None
-
-    weather_base_url = "https://api.weather.gov/points/"
-    try:
-        res_weather = requests.get(f"{weather_base_url}{geolocation[0]},{geolocation[1]}")
-        res_dict = res_weather.json()
-
-        res_weather_detail = requests.get(res_dict['properties']['forecast'])
-        forecast_data = res_weather_detail.json()
-
-        formatted_date = datetime.datetime.strptime(date, '%Y-%m-%dT%H:%M:%S%z').strftime('%Y-%m-%d')
-
-        for period in forecast_data["properties"]["periods"]:
-            period_start = datetime.datetime.strptime(period["startTime"], '%Y-%m-%dT%H:%M:%S%z').strftime('%Y-%m-%d')
-            if period_start == formatted_date:
-                return period["detailedForecast"], period["temperature"]
-    except Exception as ex:
-        print('Exception in get_weather:', ex)
-        
-    return None, None
-
 def get_detail_page():
     links = json.load(open(URL_LIST_FILE, 'r'))
     data = []
     for link in links:
-        time.sleep(SLEEP_INTERVAL)  # Respectful scraping by waiting a bit between requests
         try:
             row = {}
             res = requests.get(link)
-            # Extract necessary details here as per your page's HTML structure
-            row['title'] = html.unescape(re.search(r'<h1 class="page-title">(.+?)</h1>', res.text).group(1))
-            # Add other details extraction here...
-
-            # Geolocation and weather data fetching
-            geolocation = get_geolocation(row.get('venue', ''), row.get('location', ''))
-            if geolocation != (None, None):
-                weather_condition, temperature = get_weather(geolocation, row['date'])
-                row.update({
-                    'geolocation': geolocation,
-                    'weather_condition': weather_condition,
-                    'temperature': temperature
-                })
+            row['title'] = html.unescape(re.findall(r'<h1 class="page-title" itemprop="headline">(.+?)</h1>', res.text)[0])
+            datetime_venue = re.findall(r'<h4><span>.*?(\d{1,2}/\d{1,2}/\d{4})</span> \| <span>(.+?)</span></h4>', res.text)[0]
+            row['date'] = datetime.datetime.strptime(datetime_venue[0], '%m/%d/%Y').replace(tzinfo=ZoneInfo('America/Los_Angeles')).isoformat()
+            row['venue'] = datetime_venue[1].strip() # remove leading/trailing whitespaces
+            metas = re.findall(r'<a href=".+?" class="button big medium black category">(.+?)</a>', res.text)
+            row['category'] = html.unescape(metas[0])
+            row['location'] = metas[1]
+            lat, lon = get_geolocation(row['venue'], row['location'])
+            row['latitude'] = lat
+            row['longitude'] = lon
 
             data.append(row)
-        except Exception as e:
-            print(f'Error processing {link}: {e}')
-    
+        except IndexError as e:
+            print(f'Error: {e}')
+            print(f'Link: {link}')
     json.dump(data, open(URL_DETAIL_FILE, 'w'))
 
 def insert_to_pg():
     conn = get_db_conn()
     cur = conn.cursor()
 
-    q = '''
-    CREATE TABLE IF NOT EXISTS events (
-        url TEXT PRIMARY KEY,
-        title TEXT,
-        date TIMESTAMP WITH TIME ZONE,
-        venue TEXT,
-        category TEXT,
-        location TEXT,
-        weather_condition TEXT,
-        temperature_min TEXT,
-        temperature_max TEXT,
-        temperature_windchill TEXT
-    );
-    '''
-    cur.execute(q)
-    
+    # First, ensure that the events table exists with all the necessary columns
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS events (
+            url TEXT PRIMARY KEY,
+            title TEXT,
+            date TIMESTAMP WITH TIME ZONE,
+            venue TEXT,
+            category TEXT,
+            location TEXT,
+            weather_condition TEXT,
+            temperature_min INT,
+            temperature_max INT,
+            windchill INT,
+            latitude DOUBLE PRECISION,
+            longitude DOUBLE PRECISION
+        );
+    ''')
+
+    # Then, add latitude and longitude columns to your table if they don't already exist
+    cur.execute('''
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS weather_condition TEXT;
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS temperature_min INT;
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS temperature_max INT;
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS windchill INT;
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
+        ALTER TABLE events ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
+    ''')
+
+    # Now, read the collected event data and weather information
     urls = json.load(open(URL_LIST_FILE, 'r'))
     data = json.load(open(URL_DETAIL_FILE, 'r'))
+
+    # Insert or update each event into the events table
     for url, row in zip(urls, data):
         q = '''
-        INSERT INTO events (url, title, date, venue, category, location, weather_condition, temperature_min, temperature_max, temperature_windchill)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (url) DO NOTHING;
+        INSERT INTO events (url, title, date, venue, category, location, weather_condition, temperature_min, temperature_max, windchill, latitude, longitude)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (url) DO UPDATE SET
+            title = EXCLUDED.title,
+            date = EXCLUDED.date,
+            venue = EXCLUDED.venue,
+            category = EXCLUDED.category,
+            location = EXCLUDED.location,
+            weather_condition = EXCLUDED.weather_condition,
+            temperature_min = EXCLUDED.temperature_min,
+            temperature_max = EXCLUDED.temperature_max,
+            windchill = EXCLUDED.windchill,
+            latitude = EXCLUDED.latitude,
+            longitude = EXCLUDED.longitude;
         '''
         cur.execute(q, (
             url, 
@@ -146,13 +144,18 @@ def insert_to_pg():
             row['venue'], 
             row['category'], 
             row['location'], 
-            row.get('weather_condition', None), 
-            row.get('temperature_min', None), 
-            row.get('temperature_max', None), 
-            row.get('temperature_windchill', None)
+            row.get('weather_condition', 'Not available'),
+            row.get('temperature_min', None),
+            row.get('temperature_max', None),
+            row.get('windchill', None),
+            row.get('latitude'),  # Assuming latitude is always present
+            row.get('longitude')  # Assuming longitude is always present
         ))
-    
-    conn.commit()  # Commit the transaction
+
+    # Commit the changes to the database
+    conn.commit()
+
+    # Close the database connection
     cur.close()
     conn.close()
 
